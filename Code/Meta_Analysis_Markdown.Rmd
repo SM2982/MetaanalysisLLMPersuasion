@@ -1,0 +1,1427 @@
+---
+title: "Meta_Analysis_Persuasion"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-10-27"
+---
+
+# Prepare environment
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+rm(list=ls())
+
+# 2. Install & Load Libraries
+packages <- c(
+  "metafor", "tidyverse", "ggtext", "gridExtra", "broom", "knitr", "xtable", "rstudioapi","readxl", "writexl", "xfun"
+)
+
+install_and_load <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+invisible(lapply(packages, install_and_load))
+
+  # Get the directory two levels above the script (i.e., the project root)
+# Use knitr::current_input() for knitting, rstudioapi for interactive use
+if (!is.null(knitr::current_input())) {
+  # When knitting
+  project_root <- dirname(dirname(normalizePath(knitr::current_input())))
+} else if (rstudioapi::isAvailable()) {
+  # When running interactively in RStudio
+  project_root <- dirname(dirname(rstudioapi::getActiveDocumentContext()$path))
+} else {
+  # Fallback: use current working directory's parent
+  project_root <- dirname(getwd())
+}
+
+  # Define data and output directories
+data_dir   <- file.path(project_root, "Data")
+output_dir <- file.path(project_root, "Plots")
+
+if (!dir.exists(output_dir)) dir.create(output_dir)
+```
+
+
+# Load dataset
+```{r}
+df_raw <- readxl::read_excel(file.path(data_dir, "Data_final.xlsx"))
+
+
+# 5. Convert German-style commas to points for numeric columns (defined manually)
+numeric_cols <- c(
+  "n_total", "n_treatment", "M_treatment", "M_treatment_emm", "M_treatment_perc","CI_lower_treatment",
+  "CI_upper_treatment", "SE_treatment", "SD_treatment", "n_control", "M_control",
+  "M_control_emm", "M_control_perc", "CI_lower_control",
+  "CI_upper_control", "t_value", "SE_control", "SD_control", 
+  "F_value", "odds_ratio", "CI_lower_or", "CI_upper_or",
+  "cohens_d", "M_diff", "SE_diff"
+)
+
+df_clean <- df_raw
+
+for (col in numeric_cols) {
+  if (col %in% names(df_clean)) {
+    df_clean[[col]] <- df_clean[[col]] |>
+      as.character() |>
+      str_replace_all(",", ".") |>
+      as.numeric()
+  }
+}
+df_clean$pub_year <- df_clean$`Publication Year`
+```
+
+# Calculation of Cohens'd based on the different data
+```{r}
+compute_cohens_d <- function(df) {
+  log_to_d <- sqrt(3) / pi
+  z_value  <- 1.96 #applicable forr 95% CI
+  
+  results <- list()
+  
+  ## ---- Case 1: Means & SDs -> SMD (Hedges' g)
+  res1 <- df %>%
+    filter(!is.na(M_treatment), !is.na(SD_treatment), !is.na(n_treatment),
+           !is.na(M_control),   !is.na(SD_control),   !is.na(n_control))
+  if (nrow(res1) > 0) {
+    esc1 <- escalc(measure = "SMD",
+                   m1i = res1$M_treatment, sd1i = res1$SD_treatment, n1i = res1$n_treatment,
+                   m2i = res1$M_control,   sd2i = res1$SD_control,   n2i = res1$n_control)
+    res1$yi     <- esc1$yi
+    res1$vi     <- esc1$vi
+    res1$method <- "Mean+SD"
+    res1$is_g   <- TRUE
+    results[["1_Mean+SD"]] <- res1
+  }
+  
+  ## ---- Case 2: F-value → t → SMD (Hedges' g) 
+  res2 <- df %>%
+    filter(!is.na(F_value), !is.na(n_treatment), !is.na(n_control)) %>%
+    mutate(t_value = sqrt(F_value))
+  if (nrow(res2) > 0) {
+    esc2 <- escalc(
+      measure = "SMD",
+      ti = res2$t_value,
+      n1i = res2$n_treatment,
+      n2i = res2$n_control
+    )
+    res2$yi <- esc2$yi
+    res2$vi <- esc2$vi
+    
+    if (all(c("M_treatment", "M_control") %in% names(res2))) {
+      dir <- sign(res2$M_treatment - res2$M_control)
+      dir[is.na(dir)] <- 1   # if NA in the difference
+      res2$yi <- res2$yi * dir
+    }
+    
+    res2$method <- "F to d"
+    res2$is_g   <- TRUE
+    results[["2_F_to_d"]] <- res2
+  }
+  
+  
+  
+  ## ---- Case 3: t-value -> SMD (Hedges' g)
+  res3 <- df %>%
+    filter(!is.na(t_value), !is.na(n_treatment), !is.na(n_control))
+  if (nrow(res3) > 0) {
+    esc3 <- escalc(measure = "SMD", ti = res3$t_value, n1i = res3$n_treatment, n2i = res3$n_control)
+    res3$yi     <- esc3$yi
+    res3$vi     <- esc3$vi
+    res3$method <- "t to d"
+    res3$is_g   <- TRUE
+    results[["3_t_to_d"]] <- res3
+  }
+  
+  ## ---- Case 4: Regressions b & SE  ->  t  ->  SMD (Hedges' g)
+  res4 <- df %>%
+    filter(!is.na(M_diff), !is.na(SE_diff),
+           !is.na(n_treatment), !is.na(n_control)) %>%
+    mutate(
+      t_value = M_diff / SE_diff
+    )
+  
+  if (nrow(res4) > 0) {
+    esc4 <- escalc(
+      measure = "SMD",
+      ti  = res4$t_value,
+      n1i = res4$n_treatment,
+      n2i = res4$n_control
+    )
+    
+    res4$yi     <- esc4$yi   # Hedges' g
+    res4$vi     <- esc4$vi   # Variance of g
+    res4$method <- "Reg b/SE -> t -> SMD"
+    res4$is_g   <- TRUE
+    
+    # (optional) 
+    res4 <- res4 %>% select(-t_value)
+    
+    results[["4_Reg_bSE_to_SMD"]] <- res4
+  }
+  
+  
+  ## ---- Case 5: Odds Ratio (+ 95%-CI) -> d (transformation based on Cochrane Handbook and Chinn (2000))
+  res5 <- df %>%
+    filter(!is.na(odds_ratio), !is.na(CI_lower_or), !is.na(CI_upper_or),
+           odds_ratio > 0, CI_lower_or > 0, CI_upper_or > 0,
+           CI_upper_or > CI_lower_or) %>%
+    mutate(
+      log_or    = log(odds_ratio),
+      se_log_or = (log(CI_upper_or) - log(CI_lower_or)) / (2 * z_value),
+      yi        = log_or * log_to_d,
+      vi        = (se_log_or^2) * (3 / pi^2),
+      method    = "OR to d",
+      is_g      = FALSE
+    ) %>%
+    select(-log_or, -se_log_or)
+  if (nrow(res5) > 0) results[["5_OR_to_d"]] <- res5
+  
+  ## ---- Case 6: Proportions (Agreement Rate) with CI (orig) -> d (Delta-Method + Logit)
+  res6 <- df %>%
+    filter(!is.na(M_treatment_perc), !is.na(M_control_perc),
+           !is.na(CI_upper_treatment), !is.na(CI_lower_treatment),
+           !is.na(CI_upper_control),  !is.na(CI_lower_control),
+           CI_upper_treatment > CI_lower_treatment,
+           CI_upper_control  > CI_lower_control) %>%
+    mutate(
+      p_t_raw = M_treatment_perc,
+      p_c_raw = M_control_perc,
+      p_t = ifelse(p_t_raw > 1, p_t_raw / 100, p_t_raw),
+      p_c = ifelse(p_c_raw > 1, p_c_raw / 100, p_c_raw),
+      se_p_t = (CI_upper_treatment - CI_lower_treatment) / (2 * z_value),
+      se_p_c = (CI_upper_control  - CI_lower_control)  / (2 * z_value)
+    ) %>%
+    filter(p_t > 0, p_t < 1, p_c > 0, p_c < 1, se_p_t > 0, se_p_c > 0) %>%
+    mutate(
+      eps     = 1e-6,
+      p_t_cl  = pmax(pmin(p_t, 1 - eps), eps),
+      p_c_cl  = pmax(pmin(p_c, 1 - eps), eps),
+      logit_t = log(p_t_cl / (1 - p_t_cl)),
+      logit_c = log(p_c_cl / (1 - p_c_cl)),
+      se_logit_t = se_p_t / (p_t_cl * (1 - p_t_cl)),
+      se_logit_c = se_p_c / (p_c_cl * (1 - p_c_cl)),
+      logit_diff = logit_t - logit_c,
+      var_diff   = se_logit_t^2 + se_logit_c^2,
+      yi     = logit_diff * log_to_d,
+      vi     = var_diff   * (3 / pi^2),
+      method = "Prop (CI orig) to d",
+      is_g   = FALSE
+    ) %>%
+    select(-p_t_raw, -p_c_raw, -p_t, -p_c, -se_p_t, -se_p_c,
+           -eps, -p_t_cl, -p_c_cl, -logit_t, -logit_c, -se_logit_t, -se_logit_c,
+           -logit_diff, -var_diff)
+  if (nrow(res6) > 0) results[["6_Prop_to_d"]] <- res6
+  
+  ## ---- Case 7: EMMs + CI -> SMD (Hedges' g)
+  res7 <- df %>%
+    filter(!is.na(M_treatment_emm), !is.na(M_control_emm),
+           !is.na(CI_upper_treatment), !is.na(CI_lower_treatment),
+           !is.na(CI_upper_control),  !is.na(CI_lower_control),
+           !is.na(n_treatment), !is.na(n_control),
+           CI_upper_treatment > CI_lower_treatment,
+           CI_upper_control  > CI_lower_control) %>%
+    mutate(
+      SE_treat = (CI_upper_treatment - CI_lower_treatment) / (2 * z_value),
+      SE_ctrl  = (CI_upper_control  - CI_lower_control)  / (2 * z_value),
+      SD_treat = SE_treat * sqrt(n_treatment),
+      SD_ctrl  = SE_ctrl  * sqrt(n_control)
+    ) %>%
+    filter(is.finite(SD_treat), is.finite(SD_ctrl), SD_treat > 0, SD_ctrl > 0)
+  if (nrow(res7) > 0) {
+    esc7 <- escalc(measure = "SMD",
+                   m1i = res7$M_treatment_emm, sd1i = res7$SD_treat, n1i = res7$n_treatment,
+                   m2i = res7$M_control_emm,   sd2i = res7$SD_ctrl,  n2i = res7$n_control)
+    res7$yi     <- esc7$yi   # g
+    res7$vi     <- esc7$vi   # Var(g)
+    res7$method <- "EMM + CI to SMD"
+    res7$is_g   <- TRUE
+    results[["7_EMM_CI_to_SMD"]] <- res7
+  }
+  
+  ## ---- Combine all
+  priority <- c("Mean+SD", "t to d", "F to d",
+                "EMM + CI to SMD", "Prop (CI orig) to d",
+                "OR to d", "Reg b/SE -> t -> SMD")
+  
+  if (length(results) == 0) {
+    combined <- df %>%
+      transmute(Study_ID, Report_ID,
+                yi = NA_real_, vi = NA_real_,
+                method = NA_character_, is_g = NA)
+  } else {
+    combined <- bind_rows(results) %>%
+      mutate(method = factor(method, levels = priority)) %>%
+      arrange(Study_ID, Report_ID, method) %>%
+      group_by(Study_ID, Report_ID) %>%
+      slice(1) %>%
+      ungroup() %>%
+      select(Study_ID, Report_ID, yi, vi, method, is_g)
+  }
+  
+  
+# 7. back to original dataset
+  df_out <- df %>%
+    select(-any_of(c("yi", "vi", "method", "is_g"))) %>%
+    left_join(combined, by = c("Study_ID", "Report_ID"))
+  
+  return(df_out)
+}
+```
+
+# Raw effect to hedges g
+```{r}
+safe_calc_effects <- function(df) {
+  df <- compute_cohens_d(df)
+  
+ df <- df %>%
+  mutate(
+    df_total = n_treatment + n_control - 2,
+      J        = 1 - (3 / pmax(4 * df_total - 1, 1e-8)) 
+    )
+  
+  # hedge_g = yi, vi_g = vi (for cases that are already hedges' g)
+  hedge_g <- df$yi
+  vi_g    <- df$vi
+  
+  # for is_g == FALSE (-> d) 
+  idx <- !is.na(df$is_g) & df$is_g == FALSE
+  hedge_g[idx] <- df$yi[idx] * df$J[idx]
+  vi_g[idx]    <- df$vi[idx] * (df$J[idx]^2)
+  
+  df$hedge_g <- hedge_g
+  df$vi_g    <- vi_g
+  
+  return(df)
+}
+
+```
+
+# Apply Effect Size Computation to Main Dataset
+```{r}
+df_clean <- safe_calc_effects(df_clean)
+df_clean
+
+# 10. Inspect Computed Effect Sizes 
+inspect_effects <- df_clean %>%
+  select(Study_ID, Report_ID, method, is_g, yi, vi, hedge_g, vi_g)
+
+# 11. Optionally: Write to XLSX 
+write_xlsx(inspect_effects, path = file.path(output_dir, "all_effect_sizes.xlsx"))
+```
+
+# Run meta analysis
+Here we use the restricted maximum likelihood estimator (Viechtbauer, 2005; Raudenbush, 2009)
+-> correcting for small sample bias
+```{r}
+# 12. Set parameters for meta-analysis
+plot_filename <- "main_forest_plot"
+allow_moderator <- TRUE
+
+# (1) Fit random-effects model using Hedges' g
+res <- rma(yi = hedge_g, vi = vi_g, data = df_clean, method = "REML")
+```
+
+```{r}
+# (2) Print results
+summary_res <- summary(res)
+print(summary_res)
+```
+
+```{r}
+# (3) Influence diagnostics
+if (allow_moderator) {
+  inf <- influence(res)
+  
+  # Display influence diagnostics in R Markdown output
+  print(inf)
+  
+  # Export influence diagnostics to file
+  capture.output(
+    print(inf),
+    file = file.path(output_dir, paste0(plot_filename, "_influence_diagnostics.txt"))
+  )
+  
+  # Plot influence diagnostics
+  plot(inf)
+  dev.copy2pdf(file = file.path(output_dir, paste0(plot_filename, "_influence_diagnostics.pdf")),
+               width = 6.5, height = 6.5)
+}
+```
+
+```{r}
+# (4) Leave-one-out sensitivity analysis
+sens <- leave1out(res)
+
+# Export leave-one-out results to file
+capture.output(
+  print(sens),
+  file = file.path(output_dir, paste0(plot_filename, "_leave1out_sensitivity.txt"))
+)
+
+# Plot leave-one-out sensitivity
+est <- sens$estimate
+plot(est, type = "b", xlab = "Omitted study", ylab = "Pooled estimate")
+dev.copy2pdf(file = file.path(output_dir, paste0(plot_filename, "_leave1out_sensitivity.pdf")),
+             width = 6.5, height = 6.5)
+```
+
+```{r}
+# (5) Publication bias checks (only if k ≥ 10)
+if (res$k >= 10) {
+  # Egger's test
+  egger_test <- regtest(res, model = "rma")
+  
+  # Display Egger's test in R Markdown output
+  print(egger_test)
+  
+  # Export Egger's test to file
+  capture.output(
+    print(egger_test),
+    file = file.path(output_dir, paste0(plot_filename, "_funnel_egger_test.txt"))
+  )
+  
+  # Standard funnel plot
+  funnel(res)
+  dev.copy2pdf(file = file.path(output_dir, paste0(plot_filename, "_funnel_plot.pdf")),
+               width = 6.5, height = 6.5)
+  
+  # Trim-and-fill analysis
+  tf <- trimfill(res)
+  
+  # Display trim-and-fill results in R Markdown output
+  print(summary(tf))
+  
+  # Export trim-and-fill results to file
+  capture.output(
+    print(summary(tf)),
+    file = file.path(output_dir, paste0(plot_filename, "_funnel_trimm_fill.txt"))
+  )
+  
+  # Funnel plot with imputed studies
+  orig_k <- res$k
+  funnel(res, pch = 19, col = "black")
+  if (tf$k0 > 0) {
+    pts <- (orig_k + 1):(orig_k + tf$k0)
+    points(
+      x = tf$yi[pts],
+      y = sqrt(tf$vi[pts]),
+      pch = 21, bg = "red", col = "red"
+    )
+  }
+  dev.copy2pdf(file = file.path(output_dir, paste0(plot_filename, "_funnel_trimfill.pdf")),
+               width = 6.5, height = 6.5)
+} else {
+  message("Skipping Egger's test and funnel/trim‐and‐fill (k = ", res$k, " < 10).")
+}
+```
+
+```{r}
+# (6) Prepare data frame for plotting
+# Use weights directly from the metafor model
+model_weights <- weights(res)
+
+plot_data <- df_clean %>%
+  mutate(
+    effect = hedge_g,
+    se     = sqrt(vi_g),
+    ci.lb  = effect - 1.96 * se,
+    ci.ub  = effect + 1.96 * se,
+    weight = model_weights / sum(model_weights) * 100,
+    study  = paste0(Study_ID, "_", Report_ID)
+  ) %>%
+  arrange(desc(effect)) %>%
+  mutate(order = row_number())
+
+# (7) Classify significance and assign color
+plot_data <- plot_data %>%
+  mutate(
+    sign = case_when(
+      ci.lb >  0 ~ "positive",
+      ci.ub <  0 ~ "negative",
+      TRUE       ~ "ns"
+    ),
+    col = case_when(
+      sign == "positive" ~ "#006400",
+      sign == "negative" ~ "#8B0000",
+      sign == "ns"       ~ "grey40"
+    )
+  )
+
+plot_df <- plot_data
+
+# (8) Dynamic plot layout configuration
+x_max <- max(plot_df$ci.ub, na.rm = TRUE)
+x_pad <- x_max + 0.15 * diff(range(plot_df$ci.lb, plot_df$ci.ub))
+
+n_rows         <- nrow(plot_df)
+row_height     <- 0.6
+extra_space    <- 3
+plot_height_cm <- n_rows * row_height + extra_space
+
+# (9) Build forest plot
+p <- ggplot(plot_df, aes(x = effect, y = order)) +
+  # Orange CI rectangle for overall effect
+  annotate("rect",
+           xmin = summary_res$ci.lb,
+           xmax = summary_res$ci.ub,
+           ymin = -Inf, ymax = Inf,
+           fill = "orange", alpha = 0.3) +
+  # Vertical line at zero
+  geom_vline(xintercept = 0, color = "black", linewidth = 0.7, alpha = 0.6) +
+  # CI segment per study
+  geom_segment(aes(x = ci.lb, xend = ci.ub, y = order, yend = order, color = col),
+               linewidth = 4, alpha = 0.3) +
+  # Line at study effect
+  geom_segment(aes(x = effect, xend = effect, y = order - 0.3, yend = order + 0.3, color = col),
+               linewidth = 1) +
+  scale_color_identity(guide = "none") +
+  # Dashed line for summary effect
+  geom_vline(xintercept = summary_res$b[1], linetype = "dashed", color = "orange", linewidth = 0.75) +
+  # Label for summary effect
+  geom_label(
+    data = tibble(
+      effect = summary_res$b[1],
+      order  = max(plot_df$order) + 1
+    ),
+    aes(x = effect, y = order, label = sprintf("Hedges' g = %.4f", effect)),
+    fill = "white", label.size = 0.2, color = "orange", size = 3.5, hjust = 0.5
+  ) +
+  # Y-axis layout and mirrored labels
+  scale_y_reverse(
+    breaks = plot_df$order,
+    labels = plot_df$study,
+    expand = expansion(add = c(0.3, 0.3)),
+    sec.axis = sec_axis(
+      transform = ~ .,
+      breaks = plot_df$order,
+      labels = plot_df$study,
+      name = NULL
+    )
+  ) +
+  # Display weight percentage next to each study
+  geom_text(aes(x = x_pad, y = order, label = sprintf("%.1f%%", weight)),
+            hjust = 0, size = 4) +
+  # Finer x-axis scaling from -0.5 to 0.5 in 0.1 steps
+  scale_x_continuous(
+    breaks = seq(-0.5, 0.5, by = 0.1),                         
+    labels = c("-0.5", "", "", "", "", "0", "", "", "", "", "0.5")  
+  ) + 
+
+  # Minimal theme and style
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text       = element_text(size = 12),
+    axis.text.y.left = element_text(size = 12),
+    axis.text.y.right = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    plot.margin = margin(5, 10, 5, 5, "mm")
+  ) +
+  # Allow overflow outside plot area
+  coord_cartesian(clip = "off") +
+  # Axis labels
+  labs(
+    x = bquote("Effect size (Hedges' " * italic(g) * ")"),
+    y = NULL
+  )
+
+# Display the plot
+print(p)
+```
+
+```{r}
+# (10) Save forest plot and export as PDF
+ggsave(file.path(output_dir, paste0(plot_filename, "_forest_plot.pdf")),
+       plot = p,
+       width = 12,
+       height = plot_height_cm,
+       units = "cm")
+```
+
+
+# Cumulative meta analysis
+```{r}
+# 14. Cumulative Meta-Analysis by Publication Year 
+
+# Remove any studies with missing publication years
+df_year <- df_clean[!is.na(df_clean$pub_year), ]
+
+# Store summary statistics for later display
+n_studies_cumul <- nrow(df_year)
+n_studies_excluded <- nrow(df_clean) - nrow(df_year)
+studies_by_year <- as.data.frame(table(df_year$pub_year))
+colnames(studies_by_year) <- c("Publication Year", "Number of Studies")
+
+# Order by publication year (earliest first)
+year_order <- order(df_year$pub_year)
+
+# Fit the model for studies with publication year data (using metafor)
+res_main_year <- rma(yi = hedge_g, vi = vi_g, data = df_year, method = "REML")
+
+# Run cumulative meta-analysis using metafor's cumul() function
+res_cumul_year <- cumul(res_main_year, order = year_order)
+
+# Save detailed results
+sink(file.path(output_dir, "cumulative_meta_analysis_by_year.txt"))
+for(i in 1:length(year_order)) {
+  idx <- year_order[i]
+  cat(sprintf("Study %d: %s (Year: %d, Effect: %.3f)\n", 
+              i, df_year$Study_ID[idx], df_year$pub_year[idx], df_year$hedge_g[idx]))
+}
+cat("\n\nCumulative Results:\n")
+print(res_cumul_year)
+sink()
+
+# Create comprehensive forest plot using metafor
+# Use appropriate xlim based on actual data range
+data_range <- range(c(res_cumul_year$ci.lb, res_cumul_year$ci.ub), na.rm = TRUE)
+xlim_range <- c(data_range[1] - 0.1 * diff(data_range), 
+                data_range[2] + 0.1 * diff(data_range))
+
+# Create cleaner labels
+clean_labels <- paste0("Through ", df_year$pub_year[year_order], 
+                      " (", df_year$Study_ID[year_order], ")")
+
+# Forest plot with improved parameters
+forest(res_cumul_year, 
+       xlim = xlim_range,
+       xlab = "Cumulative Hedges' g",
+       slab = clean_labels,
+       main = "Cumulative Meta-Analysis: LLM Persuasion Effects by Publication Year",
+       cex = 0.75,
+       cex.lab = 0.8,
+       cex.axis = 0.8,
+       digits = 3,
+       addfit = TRUE)
+
+dev.copy2pdf(file = file.path(output_dir, "cumulative_forest_plot_by_year.pdf"), 
+             width = 12, height = max(8, length(res_cumul_year$estimate) * 0.8))
+
+# Prepare data for ggplot visualizations
+cumul_data_year <- data.frame(
+  pub_year = df_year$pub_year[year_order],
+  studies_included = 1:nrow(df_year),
+  estimate = res_cumul_year$estimate,
+  ci_lower = res_cumul_year$ci.lb,
+  ci_upper = res_cumul_year$ci.ub,
+  tau2 = res_cumul_year$tau2,
+  i2 = res_cumul_year$I2,
+  se = sqrt(res_cumul_year$se^2)  # Standard error
+)
+
+# Add study information for labels
+cumul_data_year$study_id <- df_year$Study_ID[year_order]
+cumul_data_year$study_label <- paste0("Study ", cumul_data_year$studies_included, 
+                                     "\n(", cumul_data_year$pub_year, ")")
+
+# Main Evolution Plot with ggplot2
+p_evolution <- ggplot(cumul_data_year, aes(x = studies_included, y = estimate)) +
+  
+  # Background shading for different years (improved readable orange to brown gradient)
+  annotate("rect", xmin = 0.5, xmax = 2.5, ymin = -Inf, ymax = Inf, 
+           fill = "#FFE4B5", alpha = 0.3) +  # 2023 - light orange (moccasin)
+  annotate("rect", xmin = 2.5, xmax = 5.5, ymin = -Inf, ymax = Inf, 
+           fill = "#DEB887", alpha = 0.3) +  # 2024 - medium brown (burlywood)
+  annotate("rect", xmin = 5.5, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "#CD853F", alpha = 0.3) +  # 2025 - darker brown (peru)
+  
+  # Confidence interval ribbon
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), 
+              alpha = 0.25, fill = "#CD853F") +  # Harmonious brown tone
+  
+  # Main effect line
+  geom_line(color = "#8B4513", linewidth = 1.3, alpha = 0.9) +  # Changed to darker brown
+  
+  # Points colored by publication year
+  geom_point(aes(fill = factor(pub_year)), 
+             size = 4, shape = 21, stroke = 0.8, color = "white") +
+  
+  # Reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", alpha = 0.7) +
+  geom_hline(yintercept = tail(cumul_data_year$estimate, 1), 
+             linetype = "dotted", color = "#8B4513", alpha = 0.8, linewidth = 1) +
+  
+  # Year labels (improved readable orange to brown gradient)
+  annotate("text", x = 1.5, y = max(cumul_data_year$ci_upper) * 0.92, 
+           label = "2023", size = 4, fontface = "bold", color = "#FF8C00") +  # Dark orange - very readable
+  annotate("text", x = 4, y = max(cumul_data_year$ci_upper) * 0.92, 
+           label = "2024", size = 4, fontface = "bold", color = "#D2691E") +  # Chocolate - medium 
+  annotate("text", x = 8.5, y = max(cumul_data_year$ci_upper) * 0.92, 
+           label = "2025", size = 4, fontface = "bold", color = "#8B4513") +  # Saddle brown - dark
+  
+  # Final estimate annotation
+  annotate("text", x = nrow(df_year) * 0.85, y = tail(cumul_data_year$estimate, 1) + 0.05,
+           label = paste0("Final: g = ", sprintf("%.3f", tail(cumul_data_year$estimate, 1))),
+           size = 3.5, color = "#8B4513", fontface = "bold") +
+  
+  scale_fill_manual(
+    name = "Publication Year",
+    values = c("2023" = "#FF8C00", "2024" = "#D2691E", "2025" = "#8B4513")  # Improved orange to brown gradient
+  ) +
+  
+  scale_x_continuous(
+    breaks = 1:nrow(df_year),
+    labels = cumul_data_year$study_id
+  ) +
+  
+  labs(
+    x = "Number of Studies Included",
+    y = "Cumulative Effect Size (Hedges' g)"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 10, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.3),
+    panel.grid.major.y = element_line(linewidth = 0.3),
+    axis.title = element_text(size = 11, face = "bold"),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# Display the plot in R Markdown
+print(p_evolution)
+
+# Save evolution plot
+ggsave(file.path(output_dir, "cumulative_evolution_detailed.pdf"), 
+       plot = p_evolution, width = 14, height = 8, dpi = 300)
+
+# Calculate summary statistics for tables
+effect_range <- max(cumul_data_year$estimate) - min(cumul_data_year$estimate)
+
+# Save summary table
+write.csv(cumul_data_year, file.path(output_dir, "cumulative_analysis_summary.csv"), row.names = FALSE)
+```
+
+```{r}
+# 15. Cumulative Meta-Analysis by Study Year 
+
+# Check if Study Year column exists
+if ("Study Year" %in% names(df_clean)) {
+  df_clean$study_year <- df_clean$`Study Year`
+} else {
+  # If no separate Study Year column exists, skip this analysis
+  cat("Note: No 'Study Year' column found for study year analysis.\n")
+  df_clean$study_year <- NA
+}
+
+# Remove any studies with missing study years
+df_study_year <- df_clean[!is.na(df_clean$study_year), ]
+
+if (nrow(df_study_year) > 0) {
+  # Store summary statistics for later display
+  n_studies_cumul_study <- nrow(df_study_year)
+  n_studies_excluded_study <- nrow(df_clean) - nrow(df_study_year)
+  studies_by_study_year <- as.data.frame(table(df_study_year$study_year))
+  colnames(studies_by_study_year) <- c("Study Year", "Number of Studies")
+  
+  # Order by study year (earliest first) and reorder the dataframe
+  study_year_order <- order(df_study_year$study_year)
+  df_study_year <- df_study_year[study_year_order, ]
+  
+  # Fit the model for studies with study year data (using metafor)
+  res_main_study_year <- rma(yi = hedge_g, vi = vi_g, data = df_study_year, method = "REML")
+  
+  # Run cumulative meta-analysis using metafor's cumul() function (no order parameter needed since data is already sorted)
+  res_cumul_study_year <- cumul(res_main_study_year)
+  
+  # Save detailed results
+  sink(file.path(output_dir, "cumulative_meta_analysis_by_study_year.txt"))
+  for(i in 1:nrow(df_study_year)) {
+    cat(sprintf("Study %d: %s (Study Year: %s, Effect: %.3f)\n", 
+                i, df_study_year$Study_ID[i], df_study_year$study_year[i], df_study_year$hedge_g[i]))
+  }
+  cat("\n\nCumulative Results:\n")
+  print(res_cumul_study_year)
+  sink()
+  
+  # Create comprehensive forest plot using metafor
+  data_range_study <- range(c(res_cumul_study_year$ci.lb, res_cumul_study_year$ci.ub), na.rm = TRUE)
+  xlim_range_study <- c(data_range_study[1] - 0.1 * diff(data_range_study), 
+                  data_range_study[2] + 0.1 * diff(data_range_study))
+  
+  clean_labels_study <- paste0("Through ", df_study_year$study_year, 
+                        " (", df_study_year$Study_ID, ")")
+  
+  forest(res_cumul_study_year, 
+         xlim = xlim_range_study,
+         xlab = "Cumulative Hedges' g",
+         slab = clean_labels_study,
+         main = "Cumulative Meta-Analysis: LLM Persuasion Effects by Study Year",
+         cex = 0.75,
+         cex.lab = 0.8,
+         cex.axis = 0.8,
+         digits = 3,
+         addfit = TRUE)
+  
+  dev.copy2pdf(file = file.path(output_dir, "cumulative_forest_plot_by_study_year.pdf"), 
+               width = 12, height = max(8, length(res_cumul_study_year$estimate) * 0.8))
+  
+  # Prepare data for ggplot visualizations
+  cumul_data_study_year <- data.frame(
+    study_year = df_study_year$study_year,
+    studies_included = 1:nrow(df_study_year),
+    estimate = res_cumul_study_year$estimate,
+    ci_lower = res_cumul_study_year$ci.lb,
+    ci_upper = res_cumul_study_year$ci.ub,
+    tau2 = res_cumul_study_year$tau2,
+    i2 = res_cumul_study_year$I2,
+    se = sqrt(res_cumul_study_year$se^2)
+  )
+  
+  cumul_data_study_year$study_id <- df_study_year$Study_ID
+  cumul_data_study_year$study_label <- paste0("Study ", cumul_data_study_year$studies_included, 
+                                       "\n(", cumul_data_study_year$study_year, ")")
+  
+  # Determine year ranges for background shading
+  unique_years <- sort(unique(cumul_data_study_year$study_year))
+  n_years <- length(unique_years)
+  
+  # Create background rectangles dynamically based on actual years
+  year_positions <- sapply(unique_years, function(y) {
+    idx <- which(cumul_data_study_year$study_year == y)
+    c(min(idx) - 0.5, max(idx) + 0.5)
+  })
+  
+  # Main Evolution Plot with ggplot2
+  p_evolution_study_year <- ggplot(cumul_data_study_year, aes(x = studies_included, y = estimate)) +
+    
+    # Add background shading dynamically
+    {
+      if (n_years >= 1) {
+        annotate("rect", xmin = year_positions[1,1], xmax = year_positions[2,1], 
+                 ymin = -Inf, ymax = Inf, fill = "#FFE4B5", alpha = 0.3)
+      }
+    } +
+    {
+      if (n_years >= 2) {
+        annotate("rect", xmin = year_positions[1,2], xmax = year_positions[2,2], 
+                 ymin = -Inf, ymax = Inf, fill = "#DEB887", alpha = 0.3)
+      }
+    } +
+    {
+      if (n_years >= 3) {
+        annotate("rect", xmin = year_positions[1,3], xmax = year_positions[2,3], 
+                 ymin = -Inf, ymax = Inf, fill = "#CD853F", alpha = 0.3)
+      }
+    } +
+    {
+      if (n_years >= 4) {
+        annotate("rect", xmin = year_positions[1,4], xmax = year_positions[2,4], 
+                 ymin = -Inf, ymax = Inf, fill = "#BC6C3C", alpha = 0.3)
+      }
+    } +
+    {
+      if (n_years >= 5) {
+        annotate("rect", xmin = year_positions[1,5], xmax = year_positions[2,5], 
+                 ymin = -Inf, ymax = Inf, fill = "#8B4513", alpha = 0.3)
+      }
+    } +
+    
+    # Confidence interval ribbon
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), 
+                alpha = 0.25, fill = "#CD853F") +
+    
+    # Main effect line
+    geom_line(color = "#8B4513", linewidth = 1.3, alpha = 0.9) +
+    
+    # Points colored by study year
+    geom_point(aes(fill = factor(study_year)), 
+               size = 4, shape = 21, stroke = 0.8, color = "white") +
+    
+    # Reference lines
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red", alpha = 0.7) +
+    geom_hline(yintercept = tail(cumul_data_study_year$estimate, 1), 
+               linetype = "dotted", color = "#8B4513", alpha = 0.8, linewidth = 1) +
+    
+    # Year labels (add dynamically)
+    {
+      if (n_years >= 1) {
+        annotate("text", 
+                 x = mean(c(year_positions[1,1], year_positions[2,1])), 
+                 y = max(cumul_data_study_year$ci_upper) * 0.92, 
+                 label = unique_years[1], size = 4, fontface = "bold", color = "#FF8C00")
+      }
+    } +
+    {
+      if (n_years >= 2) {
+        annotate("text", 
+                 x = mean(c(year_positions[1,2], year_positions[2,2])), 
+                 y = max(cumul_data_study_year$ci_upper) * 0.92, 
+                 label = unique_years[2], size = 4, fontface = "bold", color = "#D2691E")
+      }
+    } +
+    {
+      if (n_years >= 3) {
+        annotate("text", 
+                 x = mean(c(year_positions[1,3], year_positions[2,3])), 
+                 y = max(cumul_data_study_year$ci_upper) * 0.92, 
+                 label = unique_years[3], size = 4, fontface = "bold", color = "#CD853F")
+      }
+    } +
+    {
+      if (n_years >= 4) {
+        annotate("text", 
+                 x = mean(c(year_positions[1,4], year_positions[2,4])), 
+                 y = max(cumul_data_study_year$ci_upper) * 0.92, 
+                 label = unique_years[4], size = 4, fontface = "bold", color = "#BC6C3C")
+      }
+    } +
+    {
+      if (n_years >= 5) {
+        annotate("text", 
+                 x = mean(c(year_positions[1,5], year_positions[2,5])), 
+                 y = max(cumul_data_study_year$ci_upper) * 0.92, 
+                 label = unique_years[5], size = 4, fontface = "bold", color = "#8B4513")
+      }
+    } +
+    
+    # Final estimate annotation
+    annotate("text", x = nrow(df_study_year) * 0.85, y = tail(cumul_data_study_year$estimate, 1) + 0.05,
+             label = paste0("Final: g = ", sprintf("%.3f", tail(cumul_data_study_year$estimate, 1))),
+             size = 3.5, color = "#8B4513", fontface = "bold") +
+    
+    scale_fill_manual(
+      name = "Study Year",
+      values = setNames(c("#FF8C00", "#D2691E", "#CD853F", "#BC6C3C", "#8B4513")[1:n_years], as.character(unique_years))
+    ) +
+    
+    scale_x_continuous(
+      breaks = 1:nrow(df_study_year),
+      labels = cumul_data_study_year$study_id
+    ) +
+    
+    labs(
+      x = "Number of Studies Included",
+      y = "Cumulative Effect Size (Hedges' g)",
+      title = NULL
+    ) +
+    
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(size = 10, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(linewidth = 0.3),
+      panel.grid.major.y = element_line(linewidth = 0.3),
+      axis.title = element_text(size = 11, face = "bold"),
+      panel.background = element_rect(fill = "white", color = NA),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+    )
+  
+  print(p_evolution_study_year)
+  
+  ggsave(file.path(output_dir, "cumulative_evolution_by_study_year.pdf"), 
+         plot = p_evolution_study_year, width = 14, height = 8, dpi = 300)
+  
+  write.csv(cumul_data_study_year, file.path(output_dir, "cumulative_analysis_by_study_year_summary.csv"), row.names = FALSE)
+} else {
+  cat("No studies with valid study year data found. Skipping study year cumulative analysis.\n")
+}
+```
+
+
+
+# Main moderator analysis
+## data preparation
+```{r}
+df_mod <- df_clean
+
+    # 1) Group LLM models
+recode_llm <- function(x) {
+  x <- as.character(x)
+  x <- dplyr::recode(x,
+                     "GPT 3"             = "GPT-3.x",
+                     "GPT-3 davinci"     = "GPT-3.x",
+                     "GPT 3-davinci"     = "GPT-3.x",
+                     "GPT 3.5"           = "GPT-3.x",
+                     "GPT 4"             = "GPT-4.x",
+                     "GPT 4o"            = "GPT-4.x",
+                     "GPT 4o mini"       = "GPT-4.x",
+                     "Claude Sonnet 3.5" = "Claude 3.x",
+                     "Claude Sonnet 3.7" = "Claude 3.x",
+                     .default = x, .missing = x
+  )
+  factor(x, levels = c("GPT-3.x","GPT-4.x","Claude 3.x"))
+}
+df_mod$llm_model_grp <- recode_llm(df_mod$llm_model)
+df_mod$llm_model_grp <- relevel(df_mod$llm_model_grp, ref = "GPT-4.x")
+
+    # 2) Harmonize domains (k<2 -> "Other")
+domain_counts  <- table(df_mod$domain)
+sparse_domains <- names(domain_counts[domain_counts < 2])
+df_mod$domain  <- as.character(df_mod$domain)
+df_mod$domain[df_mod$domain %in% sparse_domains] <- "Other"
+df_mod$domain  <- factor(df_mod$domain)
+df_mod$domain  <- relevel(df_mod$domain, ref = "Health")
+
+    # 3) Interaction type as factor
+df_mod$interaction_type <- factor(df_mod$interaction_type)
+df_mod$interaction_type <- relevel(df_mod$interaction_type, ref = "Interactive")
+```
+
+# LLM Type
+```{r}
+    #Moderator: LLM Type
+res_llm <- rma(
+  yi = hedge_g,
+  vi = vi_g,
+  mods = ~ llm_model_grp,
+  data = df_mod,
+  method = "REML"
+)
+summary(res_llm)
+
+  # 95%-CI from coef(summary())
+cs_l <- coef(summary(res_llm))
+df_llm_coef <- data.frame(
+  Moderator    = rownames(cs_l),
+  Estimate     = cs_l[, "estimate"],
+  SE           = cs_l[, "se"],
+  CI_lower_95  = cs_l[, "ci.lb"],
+  CI_upper_95  = cs_l[, "ci.ub"],
+  p_value      = cs_l[, "pval"],
+  row.names    = NULL
+)
+
+    # Calculate 90% CI from original estimates first
+crit90 <- qnorm(0.95)
+df_llm_coef$CI_lower_90 <- df_llm_coef$Estimate - crit90 * df_llm_coef$SE
+df_llm_coef$CI_upper_90 <- df_llm_coef$Estimate + crit90 * df_llm_coef$SE
+
+    # Now add intercept to get actual effect sizes (for all CIs and estimates)
+intercept_value <- df_llm_coef$Estimate[df_llm_coef$Moderator == "intrcpt"]
+is_intercept <- df_llm_coef$Moderator == "intrcpt"
+
+df_llm_coef$Estimate[!is_intercept] <- df_llm_coef$Estimate[!is_intercept] + intercept_value
+df_llm_coef$CI_lower_95[!is_intercept] <- df_llm_coef$CI_lower_95[!is_intercept] + intercept_value
+df_llm_coef$CI_upper_95[!is_intercept] <- df_llm_coef$CI_upper_95[!is_intercept] + intercept_value
+df_llm_coef$CI_lower_90[!is_intercept] <- df_llm_coef$CI_lower_90[!is_intercept] + intercept_value
+df_llm_coef$CI_upper_90[!is_intercept] <- df_llm_coef$CI_upper_90[!is_intercept] + intercept_value
+
+
+llm_fac      <- df_mod$llm_model_grp
+counts_l     <- table(llm_fac)
+all_levels_l <- levels(llm_fac)
+
+    # Intercept
+dummy_levels_l <- sub("^llm_model_grp", "", df_llm_coef$Moderator[df_llm_coef$Moderator != "intrcpt"])
+ref_level_l    <- setdiff(all_levels_l, dummy_levels_l)
+if (length(ref_level_l) != 1) {
+  warning("Reference level (llm_model_grp) not unique. Check Levels/Contrasts.")
+  ref_level_l <- all_levels_l[1]
+}
+
+
+    # Labels with (n=...) 
+df_llm_coef$Moderator <- ifelse(
+  df_llm_coef$Moderator == "intrcpt",
+  paste0(ref_level_l, " (n=", as.integer(counts_l[ref_level_l]), ")"),
+  {
+    lvl <- sub("^llm_model_grp", "", df_llm_coef$Moderator)
+    paste0(lvl, " (n=", as.integer(counts_l[as.character(lvl)]), ")")
+  }
+)
+
+
+df_llm_coef$Moderator <- gsub("\\(n=", "(*n*=", df_llm_coef$Moderator)
+
+ggplot(df_llm_coef,
+       aes(x = Estimate, y = reorder(Moderator, Estimate))) +
+  
+  # 90%-CI
+  geom_errorbarh(aes(xmin = CI_lower_90, xmax = CI_upper_90, color = "90% CI"),
+                 height = 0, linewidth = 1.7, alpha = 0.95) +
+  
+  # 95%-CI
+  geom_errorbarh(aes(xmin = CI_lower_95, xmax = CI_upper_95, color = "95% CI"),
+                 height = 0, linewidth = 0.9, alpha = 0.55) +
+  
+  
+  geom_point(size = 3, shape = 21, stroke = .8,
+             fill = "#2F5597", color = "#1E3E73") +
+  
+  
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  
+  scale_color_manual(
+    name   = "CI",
+    breaks = c("90% CI","95% CI"),
+    values = c("90% CI" = "#1E3E73",  # dark blue
+               "95% CI" = "#2F5597")  # light blue
+  ) +
+  
+  labs(
+    title = NULL,
+    x = "Hedges' g (Estimate with 90% & 95% CI)",
+    y = NULL
+  ) +
+  
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.y      = element_markdown(),  # makes *n* italic
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position  = "bottom"
+  )
+
+
+    # save plot
+ggsave(
+  filename = file.path(output_dir, "llm_type_moderator_coefficient_plot.pdf"),
+  plot = last_plot(),
+  width = 6,
+  height = 4
+)
+```
+
+## Moderator Interaction Type
+```{r}
+    # Moderator: Interaction Type
+res_interaction <- rma(
+  yi = hedge_g,
+  vi = vi_g,
+  mods = ~ interaction_type,
+  data = df_mod,
+  method = "REML"
+)
+summary(res_interaction)
+
+    # 95%-CI
+cs_i <- coef(summary(res_interaction))
+df_interaction_coef <- data.frame(
+  Moderator    = rownames(cs_i),
+  Estimate     = cs_i[, "estimate"],
+  SE           = cs_i[, "se"],
+  CI_lower_95  = cs_i[, "ci.lb"],
+  CI_upper_95  = cs_i[, "ci.ub"],
+  p_value      = cs_i[, "pval"],
+  row.names    = NULL
+)
+
+    # Calculate 90% CI from original estimates first
+crit90 <- qnorm(0.95)
+df_interaction_coef$CI_lower_90 <- df_interaction_coef$Estimate - crit90 * df_interaction_coef$SE
+df_interaction_coef$CI_upper_90 <- df_interaction_coef$Estimate + crit90 * df_interaction_coef$SE
+
+    # Now add intercept to get actual effect sizes (for all CIs and estimates)
+intercept_value_i <- df_interaction_coef$Estimate[df_interaction_coef$Moderator == "intrcpt"]
+is_intercept_i <- df_interaction_coef$Moderator == "intrcpt"
+
+df_interaction_coef$Estimate[!is_intercept_i] <- df_interaction_coef$Estimate[!is_intercept_i] + intercept_value_i
+df_interaction_coef$CI_lower_95[!is_intercept_i] <- df_interaction_coef$CI_lower_95[!is_intercept_i] + intercept_value_i
+df_interaction_coef$CI_upper_95[!is_intercept_i] <- df_interaction_coef$CI_upper_95[!is_intercept_i] + intercept_value_i
+df_interaction_coef$CI_lower_90[!is_intercept_i] <- df_interaction_coef$CI_lower_90[!is_intercept_i] + intercept_value_i
+df_interaction_coef$CI_upper_90[!is_intercept_i] <- df_interaction_coef$CI_upper_90[!is_intercept_i] + intercept_value_i
+
+
+int_fac       <- df_mod$interaction_type
+counts_i      <- table(int_fac)
+all_levels_i  <- levels(int_fac)
+
+    # Intercept
+dummy_levels_i <- sub("^interaction_type", "", df_interaction_coef$Moderator[df_interaction_coef$Moderator != "intrcpt"])
+ref_level_i    <- setdiff(all_levels_i, dummy_levels_i)
+if (length(ref_level_i) != 1) {
+  warning("Reference level (interaction_type) not unique. Check Levels/Contrasts.")
+  ref_level_i <- all_levels_i[1]
+}
+
+    # Labels with (n=...) 
+df_interaction_coef$Moderator <- ifelse(
+  df_interaction_coef$Moderator == "intrcpt",
+  paste0(ref_level_i, " (n=", counts_i[ref_level_i], ")"),
+  {
+    lvl <- sub("^interaction_type", "", df_interaction_coef$Moderator)
+    paste0(lvl, " (n=", counts_i[lvl], ")")
+  }
+)
+
+
+df_interaction_coef$Moderator <- gsub("\\(n=", "(*n*=", df_interaction_coef$Moderator)
+
+
+ggplot(df_interaction_coef,
+       aes(x = Estimate, y = reorder(Moderator, Estimate))) +
+  
+  # 90%-CI
+  geom_errorbarh(aes(xmin = CI_lower_90, xmax = CI_upper_90, color = "90% CI"),
+                 height = 0, linewidth = 1.7, alpha = 0.95) +
+  
+  # 95%-CI
+  geom_errorbarh(aes(xmin = CI_lower_95, xmax = CI_upper_95, color = "95% CI"),
+                 height = 0, linewidth = 0.9, alpha = 0.55) +
+  
+ 
+  geom_point(size = 3, shape = 21, stroke = .8,
+             fill = "#2F5597", color = "#1E3E73") +
+  
+  
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  
+  scale_color_manual(
+    name   = "CI",
+    breaks = c("90% CI","95% CI"),
+    values = c("90% CI" = "#1E3E73",  # dark blue
+               "95% CI" = "#2F5597")  # light blue
+  ) +
+  
+  labs(
+    title = NULL,
+    x = "Hedges' g (Estimate with 90% & 95% CI)",
+    y = NULL
+  ) +
+  
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.y      = element_markdown(),  # makes *n* italic
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position  = "bottom"
+  )
+    # save plot
+ggsave(
+  filename = file.path(output_dir, "interaction_type_moderator_coefficient_plot.pdf"),
+  plot = last_plot(),
+  width = 6,
+  height = 4
+)
+```
+
+
+##Moderator Domain
+```{r}
+# Moderator: Domain 
+res_domain <- rma(
+  yi = hedge_g,
+  vi = vi_g,
+  mods = ~ domain,
+  data = df_mod,
+  method = "REML"
+)
+summary(res_domain)
+
+    # 95%-CI
+coef_summary <- coef(summary(res_domain))
+df_domain_coef <- data.frame(
+  Moderator = rownames(coef_summary),
+  Estimate  = coef_summary[, "estimate"],
+  SE          = coef_summary[, "se"],
+  CI_lower_95  = coef_summary[, "ci.lb"],
+  CI_upper_95  = coef_summary[, "ci.ub"],
+  p_value   = coef_summary[, "pval"]
+)
+
+    # Calculate 90% CI from original estimates first
+crit90 <- qnorm(0.95)
+df_domain_coef$CI_lower_90 <- df_domain_coef$Estimate - crit90 * df_domain_coef$SE
+df_domain_coef$CI_upper_90 <- df_domain_coef$Estimate + crit90 * df_domain_coef$SE
+
+    # Now add intercept to get actual effect sizes (for all CIs and estimates)
+intercept_value_d <- df_domain_coef$Estimate[df_domain_coef$Moderator == "intrcpt"]
+is_intercept_d <- df_domain_coef$Moderator == "intrcpt"
+
+df_domain_coef$Estimate[!is_intercept_d] <- df_domain_coef$Estimate[!is_intercept_d] + intercept_value_d
+df_domain_coef$CI_lower_95[!is_intercept_d] <- df_domain_coef$CI_lower_95[!is_intercept_d] + intercept_value_d
+df_domain_coef$CI_upper_95[!is_intercept_d] <- df_domain_coef$CI_upper_95[!is_intercept_d] + intercept_value_d
+df_domain_coef$CI_lower_90[!is_intercept_d] <- df_domain_coef$CI_lower_90[!is_intercept_d] + intercept_value_d
+df_domain_coef$CI_upper_90[!is_intercept_d] <- df_domain_coef$CI_upper_90[!is_intercept_d] + intercept_value_d
+
+
+dom_fac       <- df_mod$domain
+counts_d      <- table(dom_fac)
+all_levels_d  <- levels(dom_fac)
+
+    # Intercept
+dummy_levels_d <- sub("^domain", "", df_domain_coef$Moderator[df_domain_coef$Moderator != "intrcpt"])
+ref_level_d    <- setdiff(all_levels_d, dummy_levels_d)
+if (length(ref_level_d) != 1) {
+  warning("Reference level (domain) not unique. Check Levels/Contrasts.")
+  ref_level_d <- all_levels_d[1]
+}
+
+    # Labels with (n=...)
+df_domain_coef$Moderator <- ifelse(
+  df_domain_coef$Moderator == "intrcpt",
+  paste0(ref_level_d, " (n=", counts_d[ref_level_d], ")"),
+  {
+    lvl <- sub("^domain", "", df_domain_coef$Moderator)
+    paste0(lvl, " (n=", counts_d[lvl], ")")
+  }
+)
+
+
+
+df_domain_coef$Moderator <- gsub("\\(n=", "(*n*=", df_domain_coef$Moderator)
+
+  ggplot(df_domain_coef,
+         aes(x = Estimate, y = reorder(Moderator, Estimate))) +
+  
+  # 90%-CI
+  geom_errorbarh(aes(xmin = CI_lower_90, xmax = CI_upper_90, color = "90% CI"),
+                 height = 0, linewidth = 1.7, alpha = 0.95) +
+  
+  # 95%-CI
+  geom_errorbarh(aes(xmin = CI_lower_95, xmax = CI_upper_95, color = "95% CI"),
+                 height = 0, linewidth = 0.9, alpha = 0.55) +
+  
+  
+  geom_point(size = 3, shape = 21, stroke = .8,
+             fill = "#2F5597", color = "#1E3E73") +
+  
+ 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  
+  scale_color_manual(
+    name   = "CI",
+    breaks = c("90% CI","95% CI"),
+    values = c("90% CI" = "#1E3E73",  # dark blue
+               "95% CI" = "#2F5597")  # light blue
+  ) +
+  
+  labs(
+    title = NULL,
+    x = "Hedges' g (Estimate with 90% & 95% CI)",
+    y = NULL
+  ) +
+  
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.y      = element_markdown(),  # makes *n* italic
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position  = "bottom"
+  )
+  
+  
+    # save plot
+ggsave(
+  filename = file.path(output_dir, "domain_moderator_coefficient_plot.pdf"),
+  plot = last_plot(),
+  width = 6,
+  height = 4
+)
+```
+
+# Combined Moderators (interaction + domain + model)
+```{r}
+res_all <- rma(
+  yi = hedge_g,
+  vi = vi_g,
+  mods = ~ interaction_type + domain + llm_model_grp,
+  data = df_mod,
+  method = "REML"
+)
+summary(res_all)
+
+    # Results as df
+combined_results <- data.frame(
+  Predictor = rownames(coef(summary(res_all))),
+  Estimate  = coef(summary(res_all))[, "estimate"],
+  SE        = coef(summary(res_all))[, "se"],
+  z         = coef(summary(res_all))[, "zval"],
+  p         = coef(summary(res_all))[, "pval"],
+  CI_lower  = coef(summary(res_all))[, "ci.lb"],
+  CI_upper  = coef(summary(res_all))[, "ci.ub"]
+)
+
+    # Significance
+combined_results$Sig <- symnum(combined_results$p,
+                               corr = FALSE, na = FALSE,
+                               cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                               symbols = c("***", "**", "*", ".", ""))
+
+    # round all
+combined_results <- combined_results %>%
+  mutate(across(c(Estimate, SE, z, p, CI_lower, CI_upper), ~ round(.x, 3)))
+
+    # output as kable for LaTeX / PDF
+library(knitr)
+kable(combined_results,
+      format = "latex",
+      booktabs = TRUE,
+      caption = "Meta-regression results for the combined model.",
+      col.names = c("Predictor", "Estimate", "SE", "z", "p", "95\\% CI Lower", "95\\% CI Upper", "Sig."),
+      escape = FALSE)
+```
+
+# Robustness Check: All Studies vs. Peer-Reviewed Only
+```{r}
+# Check publication status distribution
+pub_status_table <- table(df_clean$`Publication Status`)
+
+# Filter for peer-reviewed studies only
+df_peer_reviewed <- df_clean %>%
+  filter(`Publication Status` == "Peer-reviewed" | `Publication Status` == "peer-reviewed")
+
+# Run meta-analysis on ALL studies (original)
+res_all_studies <- rma(
+  yi = hedge_g,
+  vi = vi_g,
+  data = df_clean,
+  method = "REML"
+)
+
+# Run meta-analysis on PEER-REVIEWED studies only
+res_peer_reviewed <- rma(
+  yi = hedge_g,
+  vi = vi_g,
+  data = df_peer_reviewed,
+  method = "REML"
+)
+
+# Create comparison table
+comparison_results <- data.frame(
+  Analysis = c("All Studies", "Peer-Reviewed Only"),
+  k = c(res_all_studies$k, res_peer_reviewed$k),
+  Estimate = c(res_all_studies$beta[1], res_peer_reviewed$beta[1]),
+  SE = c(res_all_studies$se, res_peer_reviewed$se),
+  CI_lower = c(res_all_studies$ci.lb, res_peer_reviewed$ci.lb),
+  CI_upper = c(res_all_studies$ci.ub, res_peer_reviewed$ci.ub),
+  z_value = c(res_all_studies$zval, res_peer_reviewed$zval),
+  p_value = c(res_all_studies$pval, res_peer_reviewed$pval),
+  I2 = c(res_all_studies$I2, res_peer_reviewed$I2),
+  tau2 = c(res_all_studies$tau2, res_peer_reviewed$tau2),
+  Q = c(res_all_studies$QE, res_peer_reviewed$QE),
+  Q_df = c(res_all_studies$k - 1, res_peer_reviewed$k - 1),
+  Q_pval = c(res_all_studies$QEp, res_peer_reviewed$QEp)
+)
+
+# Round for display
+comparison_results <- comparison_results %>%
+  mutate(
+    Estimate = round(Estimate, 4),
+    SE = round(SE, 4),
+    CI_lower = round(CI_lower, 4),
+    CI_upper = round(CI_upper, 4),
+    z_value = round(z_value, 3),
+    p_value = round(p_value, 4),
+    I2 = round(I2, 2),
+    tau2 = round(tau2, 4),
+    Q = round(Q, 3),
+    Q_pval = round(Q_pval, 4)
+  )
+comparison_results
+
+# Save comparison table
+write.csv(comparison_results, 
+          file.path(output_dir, "robustness_all_vs_peer_reviewed.csv"), 
+          row.names = FALSE)
+
+# Create a nice kable output
+kable(comparison_results,
+      format = "latex",
+      booktabs = TRUE,
+      caption = "Robustness check: Comparison of meta-analytic results for all studies vs. peer-reviewed studies only.",
+      col.names = c("Analysis", "k", "g", "SE", "95\\% CI Lower", "95\\% CI Upper", 
+                    "z", "p", "I²", "τ²", "Q", "df", "Q p"),
+      escape = FALSE,
+      digits = c(0, 0, 4, 4, 4, 4, 3, 4, 2, 4, 3, 0, 4))
+```
+
